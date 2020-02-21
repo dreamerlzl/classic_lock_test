@@ -48,48 +48,58 @@ char * round_name[] = {"no synchronization", "pthread mutex", "test and set", "t
 class Qnode
 {
   public:
-    std::atomic<bool> waiting;
-    std::atomic<Qnode *> next;
-    Qnode(){waiting.store(false, std::memory_order_release); next.store(NULL, std::memory_order_release);}
+    bool waiting;
+    Qnode * next;
+    // std::atomic<Qnode *> next;
+    Qnode()
+    {
+        waiting = false; 
+        next = NULL;
+        // next.store(NULL, std::memory_order_release);
+    }
 };
 
 std:: atomic<Qnode *> mcs_l(NULL);
 
 void mcs_lock(Qnode * me)
 {
-    me->waiting.store(true, std::memory_order_acquire);
-    Qnode * pre = mcs_l.exchange(me, std::memory_order_acq_rel);
+    me->waiting = true;
+    Qnode * pre = mcs_l.exchange(me, std::memory_order_relaxed);
     // printf("%ld enter with pre: %ld\n", me, pre);
     if(pre != NULL)
     {
-        pre->next.store(me, std::memory_order_release);
-        while(me->waiting.load(std::memory_order_acquire));
+        pre->next = me;
+        // pre->next.store(me, std::memory_order_release);
+        while(me->waiting);
     }
 }
 
 void mcs_release(Qnode * me)
 {
-    Qnode * succ = me->next.load(std::memory_order_acquire);
+    // Qnode * succ = me->next.load(std::memory_order_acquire);
+    Qnode * succ = me->next;
     Qnode * original_me = me;
     int base = 1;
     if(succ == NULL)
     {
-        if(mcs_l.compare_exchange_strong(me, NULL, std::memory_order_acq_rel))
+        if(mcs_l.compare_exchange_strong(me, NULL, std::memory_order_relaxed))
         {
             // printf("%ld leaves\n", me);
             return;
         }
         me = original_me; // if CAS fails, me will have the value of mcs_l
-        succ = me->next.load(std::memory_order_acquire);
+        // succ = me->next.load(std::memory_order_acquire);
+        succ = me->next;
         while(succ == NULL)
         {
-            succ = me->next.load(std::memory_order_acquire);
+            // succ = me->next.load(std::memory_order_acquire);
+            succ = me->next;
             pause(base);
             base <<= 1;
             // printf("%ld next %ld\n", me, succ);
         }
     }
-    succ->waiting.store(false, std::memory_order_release);
+    succ->waiting = false;
     // printf("%ld leaves\n", me);
 }
 
