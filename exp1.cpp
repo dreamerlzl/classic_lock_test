@@ -5,7 +5,10 @@
 #include <pthread.h>
 #include <cstdint>
 #include <atomic>
+#include <sstream>
 #include <unistd.h>
+// #include <vector>
+#include <fstream>
 #include "hrtimer_x86.h"
 
 #define MAX_THREAD 32
@@ -23,6 +26,7 @@ int counter;
 int thread_num;
 int I;
 int mode; // mode = 1 means experiment 1, mode = 2 means experiment 2
+int repeat;
 
 // for fetch and increment
 static std::atomic<int> atom_counter(0);
@@ -30,7 +34,7 @@ static std::atomic<int> atom_counter(0);
 // thread-related 
 pthread_t * threads;
 pthread_attr_t * attr;
-int ** count_per_thread;
+int *** count_per_thread;
 int * final;
 
 // barrier
@@ -47,9 +51,6 @@ void join();
 void issue(void * (* func) (void *));
 int random(int from, int to); // [from, to)
 
-// experiment 2
-double exp2_time;
-
 // experiment 1 
 int no_sync();
 int with_mutex();
@@ -63,7 +64,7 @@ int local();
 void pause(int);
 
 #define ROUND 9
-double elapsed[ROUND];
+double * elapsed[ROUND];
 typedef int(*funcp)();
 funcp count_method[ROUND] = {no_sync, with_mutex, tas, tatas, tatas_backoff, ticket, mcs, fai, local};
 char * round_name[] = {"no synchronization", "pthread mutex", "test and set", "test and test and set", 
@@ -96,6 +97,7 @@ std:: atomic<Qnode *> mcs_l(NULL);
 void mcs_lock(Qnode * me)
 {
     me->waiting = true;
+    me->next = NULL;
     Qnode * pre = mcs_l.exchange(me, std::memory_order_relaxed);
     // printf("%ld enter with pre: %ld\n", me, pre);
     if(pre != NULL)
@@ -310,50 +312,65 @@ int no_sync ()
     return my_count;
 }
 
-// 1000 tas locks
-std::atomic_flag tas_lock[RANDOM_COUNT];
-int random_counter[RANDOM_COUNT];
+// experiment 2
+// std:: vector<double> exp2_time[2];
 
-void * exp2(void * id)
-{
-    int pid = reinterpret_cast<intptr_t>(id);
-    #ifndef IBM
-        double start;
-    #else
-        struct timespec start, end;
-    #endif
-    
-    barrier(pid);
-    if(pid == 0)
-    {
-        #ifndef IBM
-            start = gethrtime_x86();
-        #else 
-            clock_gettime(CLOCK_MONOTONIC, &start);
-        #endif
-    }
-    barrier(pid);
-    
-    for(int my_count = 0; my_count < I; ++my_count)
-    {
-        int sample = random(0, RANDOM_COUNT);
-        while(tas_lock[sample].test_and_set(std::memory_order_acquire));
-        ++random_counter[sample];
-        tas_lock[sample].clear(std::memory_order_release);
-    }
+// // 1000 tas locks
+// std::atomic_flag tas_lock[RANDOM_COUNT];
+// int random_counter[RANDOM_COUNT];
 
-    barrier(pid);
-    if(pid == 0)
-    {
-        #ifndef IBM
-            exp2_time = gethrtime_x86() - start;
-        #else
-            clock_gettime(CLOCK_MONOTONIC, &end);
-            exp2_time = end.tv_sec - start.tv_sec;
-            exp2_time += (end.tv_nsec - start.tv_nsec)/1000000000.0;
-        #endif
-    }
-}
+// int exp2_tas()
+// {
+//     int my_count = 0;
+//     for(; my_count < I; ++my_count)
+//     {
+//         int sample = random(0, RANDOM_COUNT);
+//         while(tas_lock[sample].test_and_set(std::memory_order_acquire));
+//         ++random_counter[sample];
+//         tas_lock[sample].clear(std::memory_order_release);
+//     }
+//     return my_count;
+// }
+
+// funcp exp2_method[] = {exp2_tas};
+
+// void * exp2(void * id)
+// {
+//     int pid = reinterpret_cast<intptr_t>(id);
+//     #ifndef IBM
+//         double start;
+//     #else
+//         struct timespec start, end;
+//     #endif
+    
+//     for(int n = 0; n < repeat; ++n)
+//     for(int r = 0; r < 1; ++r)
+//     {   
+//         barrier(pid);
+//         if(pid == 0)
+//         {
+//             #ifndef IBM
+//                 start = gethrtime_x86();
+//             #else 
+//                 clock_gettime(CLOCK_MONOTONIC, &start);
+//             #endif
+//         }
+//         barrier(pid);
+        
+//         (*exp2_method[r])();
+
+//         barrier(pid);
+//         if(pid == 0)
+//         {
+//             #ifndef IBM
+//                 exp2_time[r].push_back(gethrtime_x86() - start);
+//             #else
+//                 clock_gettime(CLOCK_MONOTONIC, &end);
+//                 exp2_time[r].push_back((end.tv_nsec - start.tv_nsec)/1000000000.0 + end.tv_sec - start.tv_sec);
+//             #endif
+//         }
+//     }
+// }
 
 void * exp1(void * id)
 {
@@ -363,12 +380,44 @@ void * exp1(void * id)
     #else
         struct timespec start, end;
     #endif
-    barrier(pid);
-    for(r = 0; r < ROUND-1; ++r)
+
+    for(int n = 0; n < repeat; ++n)
     {
+        barrier(pid);
+        for(r = 0; r < ROUND-1; ++r)
+        {
+            if(pid == 0)
+            {
+                counter = 0;
+                #ifndef IBM
+                    start = gethrtime_x86();
+                #else 
+                    clock_gettime(CLOCK_MONOTONIC, &start);
+                #endif
+            }
+            
+            barrier(pid);
+
+            count_per_thread[pid][r][n] = (*count_method[r])();
+
+            barrier(pid);
+            if(pid == 0)
+            {
+                #ifndef IBM
+                    end = gethrtime_x86(); 
+                    elapsed[r][n] = end-start;
+                #else
+                    clock_gettime(CLOCK_MONOTONIC, &end);
+                    elapsed[r][n] = end.tv_sec - start.tv_sec;
+                    elapsed[r][n] += (end.tv_nsec - start.tv_nsec)/1000000000.0;
+                #endif
+                final[r] = counter;
+            }
+        }
+
+        // privatization 
         if(pid == 0)
         {
-            counter = 0;
             #ifndef IBM
                 start = gethrtime_x86();
             #else 
@@ -378,52 +427,24 @@ void * exp1(void * id)
         
         barrier(pid);
 
-        count_per_thread[pid][r] = (*count_method[r])();
+        count_per_thread[pid][r][n] = (*count_method[r])();
 
         barrier(pid);
         if(pid == 0)
         {
+            int sum = 0;
+            for(int k = 0; k < thread_num; ++k)
+                sum += count_per_thread[k][r][n];
             #ifndef IBM
                 end = gethrtime_x86(); 
-                elapsed[r] = end-start;
+                elapsed[r][n] = end-start;
             #else
                 clock_gettime(CLOCK_MONOTONIC, &end);
-                elapsed[r] = end.tv_sec - start.tv_sec;
-                elapsed[r] += (end.tv_nsec - start.tv_nsec)/1000000000.0;
+                elapsed[r][n] = end.tv_sec - start.tv_sec;
+                elapsed[r][n] += (end.tv_nsec - start.tv_nsec)/1000000000.0;
             #endif
-            final[r] = counter;
+            final[r] = sum;
         }
-    }
-
-    // privatization 
-    if(pid == 0)
-    {
-        #ifndef IBM
-            start = gethrtime_x86();
-        #else 
-            clock_gettime(CLOCK_MONOTONIC, &start);
-        #endif
-    }
-    
-    barrier(pid);
-
-    count_per_thread[pid][r] = (*count_method[r])();
-
-    barrier(pid);
-    if(pid == 0)
-    {
-        int sum = 0;
-        for(int k = 0; k < thread_num; ++k)
-            sum += count_per_thread[k][r];
-        #ifndef IBM
-            end = gethrtime_x86(); 
-            elapsed[r] = end-start;
-        #else
-            clock_gettime(CLOCK_MONOTONIC, &end);
-            elapsed[r] = end.tv_sec - start.tv_sec;
-            elapsed[r] += (end.tv_nsec - start.tv_nsec)/1000000000.0;
-        #endif
-        final[r] = sum;
     }
 
     pthread_exit(NULL);
@@ -431,7 +452,7 @@ void * exp1(void * id)
 
 int random(int from, int to)
 {
-    return rand() % (to - from + 1) + from;
+    return rand() % (to - from) + from;
 }
 
 void barrier(int tid)
@@ -470,7 +491,7 @@ void set_attr()
     pthread_attr_t attr[num_thread];
     for(int k = 0; k < num_thread; ++k)
         pthread_attr_init(&attr[k]);
-    num_cpu = (num_cpu < num_thread) ? num_cpu: num_thread;
+    // num_cpu = (num_cpu < num_thread) ? num_cpu: num_thread;
     int thread_per_cpu = num_thread / num_cpu;
     int num_ot_cpu = num_thread - thread_per_cpu * num_cpu;
 
@@ -509,22 +530,35 @@ void init()
     // init mutex lock
     pthread_mutex_init(&lock, NULL);
 
-    count_per_thread = (int **) malloc(sizeof(int *) * thread_num);
+    count_per_thread = (int ***) malloc(sizeof(int **) * thread_num);
     for(int k = 0; k < thread_num; ++k)
     {
-        count_per_thread[k] = (int *) malloc(sizeof(int) * ROUND);
-        for(int j = 0; j < ROUND; ++j)
-            count_per_thread[k][j] = 0;
+        count_per_thread[k] = (int **) malloc(sizeof(int *) * ROUND);
+        for(int r = 0; r < ROUND; ++r)
+        {    
+            count_per_thread[k][r] = (int *) malloc(sizeof(int) * repeat);
+            for(int n = 0; n < repeat; ++n)
+                count_per_thread[k][r][n] = 0;
+        }
     }
 
     final = (int *) malloc(sizeof(int) * ROUND);
 
-    // init 1000 tas locks for expr2
-    for(int i = 0; i < RANDOM_COUNT; ++i)
-    {   
-        random_counter[i] = 0; 
-        tas_lock[i].clear(std::memory_order_relaxed);
+    for(int r = 0; r < ROUND; ++r)
+    {
+        elapsed[r] = (double *)malloc(sizeof(double) * repeat);
+        if(elapsed[r] == NULL)
+        {
+            fprintf(stderr, "memory for storing time count alloc fails\n");
+            exit(1);
+        }
     }
+    // init 1000 tas locks for expr2
+    // for(int i = 0; i < RANDOM_COUNT; ++i)
+    // {   
+    //     random_counter[i] = 0; 
+    //     tas_lock[i].clear(std::memory_order_relaxed);
+    // }
 }
 
 void clean()
@@ -533,6 +567,8 @@ void clean()
     free(attr);
     for(int k = 0; k < thread_num; ++k)
     {
+        for(int r = 0; r < ROUND;++r)
+            free(count_per_thread[k][r]);
         free(count_per_thread[k]);
     }
     free(count_per_thread);
@@ -543,22 +579,49 @@ void output()
 {
     if(mode == 1)
     {
+        using namespace std;
+        stringstream s1;
+        s1 << "thread_count_" << thread_num << ".txt";
+        ofstream output(s1.str());
+        if(!output.is_open())
+        {
+            fprintf(stderr, "output file thread_count_%d.txt open fails", thread_num);
+            exit(1);
+        }
+
         final[ROUND-2] = atom_counter; // fetch and increment
         for(int r = 0; r < ROUND; ++r)
         {
-            printf("round %d %s elapsed time: %lf\n", r, round_name[r], elapsed[r]);
-            printf("final value of the counter: %d\n", final[r]);
+            double time_this_round = 0.0;
+            for(int n = 0; n < repeat; ++n)
+                time_this_round += elapsed[r][n];
+            time_this_round /= repeat;
+            printf("%lf %d\n", time_this_round, final[r]);
             for(int k = 0; k < thread_num; ++k)
-                printf("thread %d counts %d times\n", k, count_per_thread[k][r]);
-            printf("\n");
+            {
+                int thread_count = 0;
+                for(int n = 0; n < repeat; ++n)
+                    thread_count += count_per_thread[k][r][n];
+                thread_count /= repeat;
+                output << thread_count << endl;
+            }
+            output << endl << endl;
+            // printf("round %d %s elapsed time: %lf\n", r, round_name[r], elapsed[r]);
+            // printf("final value of the counter: %d\n", final[r]);
+            // for(int k = 0; k < thread_num; ++k)
+            //     printf("thread %d counts %d times\n", k, count_per_thread[k][r]);
+            // printf("\n");
         }
     }
-    else
-    {
-        printf("exp2 elapsed time: %lf\n", exp2_time);
-        for(int i = 0; i < RANDOM_COUNT;++i)
-            printf("%d: %d\n",i, random_counter[i]);
-    }
+    // else
+    // {   
+    //     for(int n = 0;n < repeat; ++n)
+    //     {
+    //         printf("%lf %lf\n", exp2_time[0][n], exp2_time[1][n]);
+    //         // for(int i = 0; i < RANDOM_COUNT;++i)
+    //         //     printf("%d: %d\n",i, random_counter[i]);
+    //     }
+    // }
 }
 
 int main(int argc, char ** argv)
@@ -571,8 +634,9 @@ int main(int argc, char ** argv)
     thread_num = 4;
     I = 10000;
     mode = 1;
+    repeat = 1;
     int rc;
-    while((rc = getopt(argc, argv, "t:i:c:m:")) != -1)
+    while((rc = getopt(argc, argv, "t:i:c:m:n:")) != -1)
     {
         switch(rc)
         {
@@ -586,7 +650,10 @@ int main(int argc, char ** argv)
                 num_cpu = atoi(optarg);
                 break;
             case 'm':
-                mode = atoi(optarg);
+                // mode = atoi(optarg);
+                break;
+            case 'n':
+                repeat = atoi(optarg);
                 break;
             case '?':
                 fprintf(stderr, "usage: -t [thread number] -i [i] -c [cpu number]\n");
@@ -600,10 +667,11 @@ int main(int argc, char ** argv)
     
     set_attr(); // set affinity, scope, etc.
     
-    if(mode == 1)
-        issue(exp1); 
-    else
-        issue(exp2);
+    // if(mode == 1)
+    //     issue(exp1); 
+    // else
+    //     issue(exp2);
+    issue(exp1);
     join();
 
     #ifndef DEBUG
