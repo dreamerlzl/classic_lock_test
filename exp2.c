@@ -1,24 +1,22 @@
 #define _GNU_SOURCE
 
-#include <immintrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
 #include "hle-emulation.h"
 
-#define IBM
-#ifdef IBM
-    #include <time.h>
-#else
-    #include "hrtimer_x86.h"
-#endif
+#include "hrtimer_x86.h"
+#include <immintrin.h>
 
-#define MAX_THREAD 32
+#define MAX_THREAD 128
 #define RANDOM_COUNT 1000
 
+int MAX_CPU=72;
+int threads_per_core = 2;
+
 //required
-int I, num_cpu, num_thread, repeat;
+int I, num_cpu, num_thread, repeat, same_socket;
 double * exp2_time[2];
 
 //thread
@@ -74,7 +72,9 @@ int exp2_hle()
         while (__hle_acquire_test_and_set1(&lock[sample]) == 1)
         {
             while (lock[sample])
-                    _mm_pause();
+            {
+                _mm_pause();
+            }
         }
         ++random_counter[sample];
         __hle_release_clear1(&lock[sample]);
@@ -85,11 +85,7 @@ int exp2_hle()
 void * exp2 (void * id)
 {
     int pid = (int) id;
-    #ifndef IBM
-        double start, end;
-    #else
-        struct timespec start, end;
-    #endif
+    struct timespec start, end;
 
     for(int n = 0;n < repeat;++n)
     for(int r = 0;r < 2;++r)
@@ -97,11 +93,7 @@ void * exp2 (void * id)
         barrier(pid);
         if(pid == 0)
         {
-            #ifndef IBM
-                start = gethrtime_x86();
-            #else 
-                clock_gettime(CLOCK_MONOTONIC, &start);
-            #endif
+            clock_gettime(CLOCK_MONOTONIC, &start);
         }
         barrier(pid);
         
@@ -110,12 +102,8 @@ void * exp2 (void * id)
         barrier(pid);
         if(pid == 0)
         {
-            #ifndef IBM
-                exp2_time[r][n] = gethrtime_x86() - start;
-            #else
-                clock_gettime(CLOCK_MONOTONIC, &end);
-                exp2_time[r][n] = (end.tv_nsec - start.tv_nsec)/1000000000.0 + end.tv_sec - start.tv_sec;
-            #endif
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            exp2_time[r][n] = (end.tv_nsec - start.tv_nsec)/1000000000.0 + end.tv_sec - start.tv_sec;
         }
     }
 }
@@ -222,7 +210,10 @@ void set_attr()
         for(int k = 0; k < thread_per_cpu + (i < num_ot_cpu); ++k, ++j)
         {
             CPU_ZERO(&cpuset);
-            CPU_SET(i, &cpuset);
+            if(same_socket)
+                CPU_SET((threads_per_core * i) % MAX_CPU + (i/MAX_CPU), &cpuset);
+            else
+                CPU_SET(i, &cpuset);
             pthread_attr_setaffinity_np(&attr[j], sizeof(cpu_set_t), &cpuset);
             pthread_attr_setscope(&attr[j], PTHREAD_SCOPE_SYSTEM);
         }
@@ -266,10 +257,13 @@ int main(int argc, char ** argv)
     I = 10000;
     repeat = 1;
     int rc;
-    while((rc = getopt(argc, argv, "t:i:c:n:")) != -1)
+    while((rc = getopt(argc, argv, "t:i:c:n:s")) != -1)
     {
         switch(rc)
         {
+            case 's':
+                same_socket = 1;
+                break;
             case 't':
                 num_thread = atoi(optarg);
                 break;

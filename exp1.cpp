@@ -11,22 +11,33 @@
 #include <fstream>
 #include "hrtimer_x86.h"
 
-#define MAX_THREAD 32
-#define RANDOM_COUNT 1000
-#define IBM
+// #define IBM
+
+static const int MAX_THREAD = 128;
+#ifdef IBM
+static const int MAX_CPU = 160;
+static const int threads_per_core = 8;
+#else
+static const int MAX_CPU = 72;
+static const int threads_per_core = 2;
+#endif
+
 #ifdef IBM
     #include <time.h>
+    #include <ppu_intrinsics.h>
 #else
     #include "hrtimer_x86.h"
+    #include <immintrin.h>
 #endif
-// #define DEBUG
 
+static int debug = 0;
+static int same_socket = 0;
+static int mode = 0; // mode == 1 means each thread counts I times
 // required
-int counter;
-int thread_num;
-int I;
-int mode; // mode = 1 means experiment 1, mode = 2 means experiment 2
-int repeat;
+static volatile int counter;
+static int thread_num;
+static int I;
+static int repeat;
 
 // for fetch and increment
 static std::atomic<int> atom_counter(0);
@@ -51,6 +62,9 @@ void join();
 void issue(void * (* func) (void *));
 int random(int from, int to); // [from, to)
 
+// maximum backoff time for backoff
+static const int max_delay = (2<<14);
+
 // experiment 1 
 int no_sync();
 int with_mutex();
@@ -63,12 +77,12 @@ int fai();
 int local();
 void pause(int);
 
-#define ROUND 9
+static const int ROUND = 9;
 double * elapsed[ROUND];
 typedef int(*funcp)();
 funcp count_method[ROUND] = {no_sync, with_mutex, tas, tatas, tatas_backoff, ticket, mcs, fai, local};
-char * round_name[] = {"no synchronization", "pthread mutex", "test and set", "test and test and set", 
-    "test and test and set with backoff", "ticket lock", "MCS lock", "fetch and increment", "local"};
+// char * round_name[] = {"no synchronization", "pthread mutex", "test and set", "test and test and set", 
+//     "test and test and set with backoff", "ticket lock", "MCS lock", "fetch and increment", "local"};
 
 int local()
 {
@@ -98,13 +112,24 @@ void mcs_lock(Qnode * me)
 {
     me->waiting = true;
     me->next = NULL;
-    Qnode * pre = mcs_l.exchange(me, std::memory_order_relaxed);
+    Qnode * pre = mcs_l.exchange(me, std::memory_order_release);
     // printf("%ld enter with pre: %ld\n", me, pre);
     if(pre != NULL)
     {
         pre->next = me;
         // pre->next.store(me, std::memory_order_release);
-        while(me->waiting);
+        #ifdef IBM
+        int base = 1;
+        #endif
+        while(me->waiting)
+        {
+            #ifndef IBM
+            _mm_pause();
+            #else
+            // pause(std::min(2<<12, base));
+            // base <<= 1;
+            #endif
+        }    
     }
 }
 
@@ -123,13 +148,19 @@ void mcs_release(Qnode * me)
         me = original_me; // if CAS fails, me will have the value of mcs_l
         // succ = me->next.load(std::memory_order_acquire);
         succ = me->next;
+        #ifdef IBM
         int base = 1;
+        #endif
         while(succ == NULL)
         {
             // succ = me->next.load(std::memory_order_acquire);
             succ = me->next;
-            pause(base);
+            #ifdef IBM
+            pause(std::min(base, 1024));
             base <<= 1;
+            #else
+            _mm_pause();
+            #endif
             // printf("%ld next %ld\n", me, succ);
         }
     }
@@ -141,17 +172,33 @@ int mcs()
 {
     int my_count = 0;
     Qnode me = Qnode();
-    while(counter < I)
-    {
-        mcs_lock(&me);
-        // printf("%d\n", counter);
-        if(counter < I)
+    if(mode)
+        while(counter < I)
         {
+            mcs_lock(&me);
+            // printf("%d\n", counter);
+            if(counter < I)
+            {
+                ++counter;
+                ++my_count;
+            }
+            mcs_release(&me);
+        }
+    else
+        while(my_count < I)
+        {
+            mcs_lock(&me);
+            #ifdef IBM
+                __lwsync();
+            #endif
             ++counter;
             ++my_count;
+            #ifdef IBM
+                __lwsync();
+            #endif
+            mcs_release(&me);
         }
-        mcs_release(&me);
-    }
+    
     return my_count;
 }
 
@@ -165,18 +212,21 @@ class TicketLock
         TicketLock():now_serving(0)
         {
             base = 1;
-            next_ticket.store(0, std::memory_order_release);
+            next_ticket.store(0, std::memory_order_relaxed);
         }
 
-        void acquire()
+        int acquire()
         {
-            int my_ticket = next_ticket.fetch_add(1, std::memory_order_acquire);
-            while(true)
+            int my_ticket = next_ticket.fetch_add(1, std::memory_order_relaxed);
+            while(now_serving != my_ticket)
             {
-                if(now_serving == my_ticket)
-                    return;
+                #ifdef IBM
                 pause(my_ticket - now_serving);
+                #else
+                _mm_pause();
+                #endif
             }
+            return my_ticket;
         }
 
         void release()
@@ -186,26 +236,53 @@ class TicketLock
 };
 
 
+
+
 int ticket()
 {
     int my_count = 0;
+    int my_ticket = 0;
     static TicketLock ticket_lock;
-    while(counter < I)
-    {
-        ticket_lock.acquire();
-        if(counter < I)
+    if(mode)
+        while(counter < I)
         {
-            ++counter;
-            ++my_count;
+            ticket_lock.acquire();
+            if(counter < I)
+            {
+                ++counter;
+                ++my_count;
+            }
+            ticket_lock.release();
         }
-        ticket_lock.release();
-    }
-
+    else
+        while(my_count < I)
+        {
+            my_ticket = ticket_lock.acquire();
+            #ifdef IBM
+                __lwsync();
+            #endif
+            if(ticket_lock.now_serving == my_ticket)
+            {   
+                ++my_count;
+                ++counter;
+            }
+            else
+            {
+                printf("lock aquisition and later critical session accesses are reordered!\n");
+                exit(1);
+            }
+            #ifdef IBM
+                __lwsync();
+            #endif
+            ticket_lock.release();
+        }
+    
     return my_count;
 }
 
 void pause(int delay)
 {
+    delay = std::min(delay, max_delay);
     for(int k = 0; k < delay; ++k);
 }
 
@@ -213,26 +290,46 @@ int tatas_backoff()
 {
     static std::atomic<bool> lock;
     int my_count = 0, delay;
-    while(counter < I)
-    {
-        // while(lock.test_and_set(std::memory_order_acquire))
-        //     while(lock.test(std::memory_order_acquire)); // sadly not supported by the g++ compiler on our cycle machine
-        delay = 1;
-        while(lock.exchange(true, std::memory_order_acquire))
-            while(lock.load(std::memory_order_acquire))
-            {
-                pause(delay);
-                delay <<= 1;
-            }
-
-        if(counter < I)
+    if(mode)
+        while(counter < I)
         {
+            // while(lock.test_and_set(std::memory_order_acquire))
+            //     while(lock.test(std::memory_order_acquire)); // sadly not supported by the g++ compiler on our cycle machine
+            delay = 1;
+            while(lock.exchange(true, std::memory_order_acquire))
+                while(lock)
+                {
+                    pause(delay);
+                    delay <<= 1;
+                }
+                // while(lock.load(std::memory_order_acquire))
+                // {
+                //     pause(delay);
+                //     delay <<= 1;
+                // }
+
+            if(counter < I)
+            {
+                ++my_count;
+                ++counter;
+            }
+            // lock.clear(std::memory_order_release);
+            lock.store(false, std::memory_order_release);
+        }
+    else
+        while(my_count < I)
+        {
+            delay = 1;
+            while(lock.exchange(true, std::memory_order_acquire))
+                while(lock)
+                {
+                    pause(delay);
+                    delay <<= 1;
+                }
             ++my_count;
             ++counter;
+            lock.store(false, std::memory_order_release);
         }
-        // lock.clear(std::memory_order_release);
-        lock.store(false, std::memory_order_release);
-    }
     return my_count;
 }
 
@@ -241,20 +338,32 @@ int tatas()
     // static std::atomic_flag lock(false);
     static std::atomic<bool> lock;
     int my_count = 0;
-    while(counter < I)
-    {
-        // while(lock.test_and_set(std::memory_order_acquire))
-        //     while(lock.test(std::memory_order_acquire));
-        while(lock.exchange(true, std::memory_order_acquire))
-            while(lock.load(std::memory_order_acquire));
-        if(counter < I)
+    if(mode)
+        while(counter < I)
         {
+            // while(lock.test_and_set(std::memory_order_acquire))
+            //     while(lock.test(std::memory_order_acquire));
+            while(lock.exchange(true, std::memory_order_acquire))
+                while(lock);
+                // while(lock.load(std::memory_order_acquire));
+            if(counter < I)
+            {
+                ++my_count;
+                ++counter;
+            }
+            // lock.clear(std::memory_order_release);
+            lock.store(false, std::memory_order_release);
+        }
+    else
+        while(my_count < I)
+        {
+            while(lock.exchange(true, std::memory_order_acquire))
+                while(lock);
             ++my_count;
             ++counter;
+            // lock.clear(std::memory_order_release);
+            lock.store(false, std::memory_order_release);
         }
-        // lock.clear(std::memory_order_release);
-        lock.store(false, std::memory_order_release);
-    }
     return my_count;
 }
 
@@ -262,115 +371,87 @@ int tas()
 {
     static std::atomic_flag lock(false);
     int my_count = 0;
-    while(counter < I)
-    {
-        while(lock.test_and_set(std::memory_order_acquire));
-        if(counter < I)
+    if(mode)
+        while(counter < I)
         {
-            ++counter;
-            ++my_count;
+            while(lock.test_and_set(std::memory_order_acquire));
+            if(counter < I)
+            {
+                ++counter;
+                ++my_count;
+            }
+            lock.clear(std::memory_order_release);
         }
-        lock.clear(std::memory_order_release);
-    }
+    else
+        while(my_count < I)
+        {
+            while(lock.test_and_set(std::memory_order_acquire));
+                ++counter;
+                ++my_count;
+            lock.clear(std::memory_order_release);
+        }
     return my_count;
 }
 
 int fai()
 {
     int my_count = 0;
-    while(atom_counter.fetch_add(1, std::memory_order_acq_rel) < I-1)
-    {
-        ++my_count;
-    }
+    if(mode)
+        while(atom_counter.fetch_add(1, std::memory_order_relaxed) < I-1)
+        {
+            ++my_count;
+        }
+    else
+        while(my_count < I)
+        {
+            atom_counter.fetch_add(1, std::memory_order_relaxed);
+            ++my_count;
+        }
     return my_count;
 }
 
 int with_mutex()
 {
     int my_count = 0;
-    while(counter < I)
-    {
-        pthread_mutex_lock(&lock);
-        if(counter < I) // without this the final sum will be larger than I 
+    if(mode)
+        while(counter < I)
         {
+            pthread_mutex_lock(&lock);
+            if(counter < I) // without this the final sum will be larger than I 
+            {
+                ++counter;
+                ++my_count;
+            }
+            pthread_mutex_unlock(&lock);
+        }
+    else
+        while(my_count < I)
+        {
+            pthread_mutex_lock(&lock);
             ++counter;
             ++my_count;
+            pthread_mutex_unlock(&lock);
         }
-        pthread_mutex_unlock(&lock);
-    }
     return my_count;
 }
 
 int no_sync ()
 {
     int my_count = 0;
-    while(counter < I)
-    {
-        ++counter;
-        ++my_count;
-    }
+    if(mode)
+        while(counter < I)
+        {
+            ++counter;
+            ++my_count;
+        }
+    else
+        while(my_count < I)
+        {
+            ++counter;
+            ++my_count;
+        }
     return my_count;
 }
-
-// experiment 2
-// std:: vector<double> exp2_time[2];
-
-// // 1000 tas locks
-// std::atomic_flag tas_lock[RANDOM_COUNT];
-// int random_counter[RANDOM_COUNT];
-
-// int exp2_tas()
-// {
-//     int my_count = 0;
-//     for(; my_count < I; ++my_count)
-//     {
-//         int sample = random(0, RANDOM_COUNT);
-//         while(tas_lock[sample].test_and_set(std::memory_order_acquire));
-//         ++random_counter[sample];
-//         tas_lock[sample].clear(std::memory_order_release);
-//     }
-//     return my_count;
-// }
-
-// funcp exp2_method[] = {exp2_tas};
-
-// void * exp2(void * id)
-// {
-//     int pid = reinterpret_cast<intptr_t>(id);
-//     #ifndef IBM
-//         double start;
-//     #else
-//         struct timespec start, end;
-//     #endif
-    
-//     for(int n = 0; n < repeat; ++n)
-//     for(int r = 0; r < 1; ++r)
-//     {   
-//         barrier(pid);
-//         if(pid == 0)
-//         {
-//             #ifndef IBM
-//                 start = gethrtime_x86();
-//             #else 
-//                 clock_gettime(CLOCK_MONOTONIC, &start);
-//             #endif
-//         }
-//         barrier(pid);
-        
-//         (*exp2_method[r])();
-
-//         barrier(pid);
-//         if(pid == 0)
-//         {
-//             #ifndef IBM
-//                 exp2_time[r].push_back(gethrtime_x86() - start);
-//             #else
-//                 clock_gettime(CLOCK_MONOTONIC, &end);
-//                 exp2_time[r].push_back((end.tv_nsec - start.tv_nsec)/1000000000.0 + end.tv_sec - start.tv_sec);
-//             #endif
-//         }
-//     }
-// }
 
 void * exp1(void * id)
 {
@@ -501,7 +582,10 @@ void set_attr()
         {
             // printf("thread id: %d cpu: %d\n", j, i);
             CPU_ZERO(&cpuset);
-            CPU_SET(i, &cpuset);
+            if(same_socket)
+                CPU_SET((threads_per_core * i) % MAX_CPU + (i/MAX_CPU), &cpuset);
+            else
+                CPU_SET(i, &cpuset);
             pthread_attr_setaffinity_np(&attr[j], sizeof(cpu_set_t), &cpuset);
             pthread_attr_setscope(&attr[j], PTHREAD_SCOPE_SYSTEM);
         }
@@ -553,12 +637,6 @@ void init()
             exit(1);
         }
     }
-    // init 1000 tas locks for expr2
-    // for(int i = 0; i < RANDOM_COUNT; ++i)
-    // {   
-    //     random_counter[i] = 0; 
-    //     tas_lock[i].clear(std::memory_order_relaxed);
-    // }
 }
 
 void clean()
@@ -575,53 +653,80 @@ void clean()
     free(final);
 }
 
-void output()
+void output(std::string output_dir)
 {
-    if(mode == 1)
+    using namespace std;
+    stringstream s1;
+    ofstream log_count_per_thread;
+    ofstream log_time_per_round;
+    if(!debug)
     {
-        using namespace std;
-        stringstream s1;
-        s1 << "thread_count_" << thread_num << ".txt";
-        ofstream output(s1.str());
-        if(!output.is_open())
+        // if(mode)
+        // {
+            s1 << output_dir << "/thread_count_" << thread_num << ".txt";
+            log_count_per_thread.open(s1.str());
+            if(!log_count_per_thread.is_open())
+            {
+                fprintf(stderr, "output file thread_count_%d.txt fails to open\n", thread_num);
+                exit(1);
+            }
+        // }
+
+        s1.str("");
+        s1 << output_dir <<"/time_round_" << thread_num << ".txt";
+        log_time_per_round.open(s1.str());
+        if(!log_time_per_round.is_open())
         {
-            fprintf(stderr, "output file thread_count_%d.txt open fails", thread_num);
+            fprintf(stderr, "output file time_round_%d.txt fails to open\n", thread_num);
             exit(1);
         }
+    }
 
-        final[ROUND-2] = atom_counter; // fetch and increment
-        for(int r = 0; r < ROUND; ++r)
-        {
-            double time_this_round = 0.0;
-            for(int n = 0; n < repeat; ++n)
-                time_this_round += elapsed[r][n];
-            time_this_round /= repeat;
-            printf("%lf %d\n", time_this_round, final[r]);
+    final[ROUND-2] = atom_counter; // fetch and increment
+    int expected;
+    if(mode)
+        expected = I;
+    else
+        expected = I * thread_num;
+    for(int r = 1; r < ROUND-2; ++r)
+        if(final[r] != expected)
+            printf("the counter of round %d is not correct!\n", r);
+
+    for(int r = 0; r < ROUND; ++r)
+    {
+        // log round time
+        double time_this_round = 0.0;
+        for(int n = 0; n < repeat; ++n)
+            time_this_round += elapsed[r][n];
+        time_this_round /= repeat;
+
+        if(debug == 1)
+            cout << time_this_round << " " << final[r] << endl;
+        else
+            log_time_per_round << time_this_round << " " << final[r] << endl;
+
+        // log thread count
+        // if(mode)
+        // {
             for(int k = 0; k < thread_num; ++k)
             {
-                int thread_count = 0;
+                float thread_count = 0.0;
                 for(int n = 0; n < repeat; ++n)
                     thread_count += count_per_thread[k][r][n];
                 thread_count /= repeat;
-                output << thread_count << endl;
+                if(!debug)
+                    log_count_per_thread << thread_count << endl;
             }
-            output << endl << endl;
-            // printf("round %d %s elapsed time: %lf\n", r, round_name[r], elapsed[r]);
-            // printf("final value of the counter: %d\n", final[r]);
-            // for(int k = 0; k < thread_num; ++k)
-            //     printf("thread %d counts %d times\n", k, count_per_thread[k][r]);
-            // printf("\n");
-        }
+            if(!debug)
+                log_count_per_thread << endl;
+        // }
     }
-    // else
-    // {   
-    //     for(int n = 0;n < repeat; ++n)
-    //     {
-    //         printf("%lf %lf\n", exp2_time[0][n], exp2_time[1][n]);
-    //         // for(int i = 0; i < RANDOM_COUNT;++i)
-    //         //     printf("%d: %d\n",i, random_counter[i]);
-    //     }
-    // }
+    if(!debug)
+    {
+        log_time_per_round.close();
+        // if(mode)
+            log_count_per_thread.close();
+    }
 }
 
 int main(int argc, char ** argv)
@@ -633,13 +738,28 @@ int main(int argc, char ** argv)
     num_cpu = 4;
     thread_num = 4;
     I = 10000;
-    mode = 1;
     repeat = 1;
+    mode = 1;
     int rc;
-    while((rc = getopt(argc, argv, "t:i:c:m:n:")) != -1)
+    std::string output_dir = "./output";
+    while((rc = getopt(argc, argv, "t:i:c:m:n:o:ds")) != -1)
     {
         switch(rc)
         {
+            case 'o':
+                output_dir.assign(optarg);
+                break;
+            case 'm':
+                mode = atoi(optarg);
+                if(mode != 0)
+                    mode = 1;
+                break;
+            case 's':
+                same_socket = 1;
+                break;
+            case 'd':
+                debug = 1;
+                break;
             case 't':
                 thread_num = atoi(optarg);
                 break;
@@ -648,9 +768,6 @@ int main(int argc, char ** argv)
                 break;
             case 'c':
                 num_cpu = atoi(optarg);
-                break;
-            case 'm':
-                // mode = atoi(optarg);
                 break;
             case 'n':
                 repeat = atoi(optarg);
@@ -667,16 +784,10 @@ int main(int argc, char ** argv)
     
     set_attr(); // set affinity, scope, etc.
     
-    // if(mode == 1)
-    //     issue(exp1); 
-    // else
-    //     issue(exp2);
     issue(exp1);
     join();
 
-    #ifndef DEBUG
-    output();
-    #endif 
+    output(output_dir);
 
     clean();
 }
