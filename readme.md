@@ -1,18 +1,18 @@
 ## Intro
 This is a simple experiment for testing the spent time and fairness for different spinlocks in multithreaded programs including:
-    - mutex
-    - test and set (tas)
-    - test and test and set (tatas)
-    - test and test and set with backoff
-    - ticket lock
-    - MCS lock
-    - Intel TSX's transactional memory usage (hardware lock elision, hle)
+- mutex
+- test and set (tas)
+- test and test and set (tatas)
+- test and test and set with backoff
+- ticket lock
+- MCS lock
+- Intel TSX's transactional memory usage (hardware lock elision, hle)
 Multiple threads contends for the lock and increment a shared counter. The experiment consists of two sub-experiments:
-    1. Experiment 1
-        1.1 **Each** thread increments the shared counter i times (testing fairness);
-        1.2 All the threads contend to increment the shared counter until the counter reaches a value(for a **total** of i times)
-    2. Experiment 2
-        - compare the intel TSX's hle and tatas with backoff. 
+1. Experiment 1
+- 1.1: **Each** thread increments the shared counter i times (testing fairness);
+- 1.2: All the threads contend to increment the shared counter until the counter reaches a value(for a **total** of i times)
+2. Experiment 2
+- compare the intel TSX's hle and tatas with backoff. 
 
 ## Build
 build executable exp1 for experiment 1
