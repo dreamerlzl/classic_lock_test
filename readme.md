@@ -7,6 +7,7 @@ This is a simple experiment for testing the spent time and fairness for differen
 - ticket lock
 - MCS lock
 - Intel TSX's transactional memory usage (hardware lock elision, hle)
+
 Multiple threads contends for the lock and increment a shared counter. The experiment consists of two sub-experiments:
 1. Experiment 1
 - 1.1: **Each** thread increments the shared counter i times (testing fairness);
